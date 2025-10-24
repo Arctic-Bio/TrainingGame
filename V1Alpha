@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>32×32 Grid — Circle vs Square (Logic Trap Game)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{--cell:18px}
+    body{font-family:Inter,system-ui,Segoe UI,Arial;margin:12px;color:#111}
+    #root{display:flex;gap:16px}
+    canvas{background:#f7f7fb;border:1px solid #ccc}
+    .panel{width:360px}
+    .row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+    button{padding:8px 10px;border-radius:8px;border:1px solid #888;background:#fff;cursor:pointer}
+    pre{height:220px;overflow:auto;background:#111;color:#0f0;padding:8px;border-radius:6px}
+    .info{font-size:13px;color:#333}
+    .controls{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  </style>
+</head>
+<body>
+  <h2>32×32 Grid — Circle (player) vs Square (goal) — Traps show 'X' then become spikes</h2>
+  <div id="root">
+    <div>
+      <canvas id="board" width="576" height="576"></canvas>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="stepBtn">Step / Advance Turn</button>
+        <button id="skipBtn">Skip Turn</button>
+        <button id="resetBtn">Reset</button>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="info row"><strong>Game API exposed as <code>window.GameAPI</code></strong></div>
+      <div class="row controls">
+        <button id="moveUp">↑</button>
+        <button id="moveLeft">←</button>
+        <button id="moveRight">→</button>
+        <button id="moveDown">↓</button>
+      </div>
+
+      <div class="row"><label>Trap spawn probability per turn: <input id="spawnProb" type="range" min="0" max="1" step="0.01" value="0.06" /></label></div>
+      <div class="row"><span id="stats"></span></div>
+      <div class="row"><button id="exportState">Export JSON State</button><button id="randomizeGoal">Move Goal</button></div>
+      <h4>Live State (matrix preview)</h4>
+      <pre id="matrixOut"></pre>
+      <h4>Notes</h4>
+      <div class="info">
+        <ul>
+          <li>Traps: <code>X</code> = preview (walkable this turn only). Next turn becomes <code>▲</code> (spike) and kills on contact.</li>
+          <li>Scoring: when the player moves, points awarded are inversely proportional to Euclidean distance to the goal (closer = more points).</li>
+          <li>API: use <code>window.GameAPI</code> methods to control and query the backend state programmatically.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+<script>
+// --- Game constants ---
+const W = 32, H = 32;
+const CELL = 18; // pixels per cell for canvas (32*18 = 576)
+const EMPTY = 0, TRAP_PREVIEW = 1, TRAP_SPIKE = 2;
+
+// --- Utility ---
+const rnd = n=>Math.floor(Math.random()*n);
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+
+// --- Game state (acts like backend) ---
+const Game = {
+  grid: null, // Int8Array W*H
+  player: {x:0,y:0,points:0,alive:true},
+  goal: {x:W-1,y:H-1},
+  turn: 0,
+  spawnProb: 0.06,
+};
+
+function newGrid(){ return new Uint8Array(W*H); }
+function idx(x,y){ return y*W + x; }
+
+function reset(seed){
+  Game.grid = newGrid();
+  Game.player = {x:1,y:1,points:0,alive:true};
+  Game.goal = {x:W-2,y:H-2};
+  Game.turn = 0;
+}
+
+reset();
+
+// --- Game mechanics ---
+function inBounds(x,y){ return x>=0 && x<W && y>=0 && y<H }
+
+function spawnRandomTraps(){
+  for(let i=0;i<W*H;i++){
+    if(Game.grid[i]===EMPTY && Math.random() < Game.spawnProb) Game.grid[i]=TRAP_PREVIEW;
+  }
+}
+
+function advanceTraps(){
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      const id = idx(x,y);
+      if(Game.grid[id]===TRAP_PREVIEW) Game.grid[id]=TRAP_SPIKE;
+      // spikes remain as spikes (danger)
+    }
+  }
+}
+
+function distance(a,b){
+  const dx=a.x-b.x, dy=a.y-b.y; return Math.hypot(dx,dy);
+}
+
+function computeMovePoints(px,py){
+  // Score increases as player gets closer to goal. Scale so values are meaningful.
+  const d = distance({x:px,y:py}, Game.goal);
+  // Max distance ~ Math.hypot(W-1,H-1) ~ 45.25; we invert and scale
+  const maxD = Math.hypot(W-1,H-1);
+  const score = Math.round(Math.max(0, (maxD - d) / maxD * 100));
+  return score;
+}
+
+function applyPlayerMove(nx,ny){
+  if(!inBounds(nx,ny) || !Game.player.alive) return {ok:false,reason:'invalid'};
+  const cell = Game.grid[idx(nx,ny)];
+  // If spike and player steps on it, death
+  if(cell === TRAP_SPIKE){ Game.player.alive=false; return {ok:false,reason:'killed by spike'} }
+  // If preview or empty, allowed
+  Game.player.x = nx; Game.player.y = ny;
+  const pts = computeMovePoints(nx,ny);
+  Game.player.points += pts;
+  return {ok:true,pointsGained:pts};
+}
+
+function skipTurn(){
+  // skipping doesn't move player but advances traps and increments turn
+  Game.turn++;
+  advanceTraps();
+  spawnRandomTraps();
+  // if player is on a spike after advancement, they die
+  const c = Game.grid[idx(Game.player.x,Game.player.y)];
+  if(c===TRAP_SPIKE) Game.player.alive=false;
+}
+
+function stepTurn(){
+  // General per-turn advancement: after player acts, we advance traps and spawn new ones
+  Game.turn++;
+  advanceTraps();
+  spawnRandomTraps();
+  // evaluate standing on spike
+  const c = Game.grid[idx(Game.player.x,Game.player.y)];
+  if(c===TRAP_SPIKE) Game.player.alive=false;
+}
+
+// --- External API (acts as backend) ---
+const GameAPI = {
+  getState(){
+    // returns JSON-serializable state including grid as 2D array
+    return {
+      w:W,h:H,turn:Game.turn,
+      player:{...Game.player},goal:{...Game.goal},
+      spawnProb: Game.spawnProb,
+      grid: Array.from(Game.grid)
+    };
+  },
+  setSpawnProb(p){ Game.spawnProb = clamp(Number(p)||0,0,1); },
+  move(dx,dy){
+    const nx = Game.player.x + dx; const ny = Game.player.y + dy;
+    const res = applyPlayerMove(nx,ny);
+    // after a player move, advance traps / spawn new ones as the rules state
+    stepTurn();
+    return res;
+  },
+  moveTo(x,y){
+    x=Math.floor(x); y=Math.floor(y);
+    const res = applyPlayerMove(x,y);
+    stepTurn();
+    return res;
+  },
+  skip(){ skipTurn(); return {ok:true}; },
+  reset(){ reset(); return {ok:true}; },
+  spawnTrapAt(x,y){ if(inBounds(x,y)) Game.grid[idx(x,y)]=TRAP_PREVIEW; return {ok:true}; },
+  clearCell(x,y){ if(inBounds(x,y)) Game.grid[idx(x,y)]=EMPTY; return {ok:true}; },
+  tick(){ stepTurn(); return {ok:true}; },
+  subscribe(cb){ // simple pubsub
+    listeners.push(cb);
+    return ()=>{ const i = listeners.indexOf(cb); if(i>=0) listeners.splice(i,1); };
+  }
+};
+
+window.GameAPI = GameAPI; // expose globally
+
+// --- UI / Rendering ---
+const canvas = document.getElementById('board');
+const ctx = canvas.getContext('2d');
+canvas.width = W*CELL; canvas.height = H*CELL;
+
+let listeners = [];
+
+function render(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  // grid
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      const v = Game.grid[idx(x,y)];
+      if(v===TRAP_PREVIEW){ ctx.fillStyle='#fff3cc'; ctx.fillRect(x*CELL,y*CELL,CELL,CELL); }
+      else if(v===TRAP_SPIKE){ ctx.fillStyle='#ffe6e6'; ctx.fillRect(x*CELL,y*CELL,CELL,CELL); }
+      else { ctx.fillStyle='#f7f7fb'; ctx.fillRect(x*CELL,y*CELL,CELL,CELL); }
+      ctx.strokeStyle='#e0e0e0'; ctx.strokeRect(x*CELL,y*CELL,CELL,CELL);
+      if(v===TRAP_PREVIEW){ ctx.fillStyle='#b45f06'; ctx.font='12px monospace'; ctx.fillText('X', x*CELL+CELL/3, y*CELL+CELL*0.65); }
+      if(v===TRAP_SPIKE){ ctx.fillStyle='#990000'; ctx.beginPath(); ctx.moveTo(x*CELL+CELL*0.5,y*CELL+CELL*0.15); ctx.lineTo(x*CELL+CELL*0.85,y*CELL+CELL*0.85); ctx.lineTo(x*CELL+CELL*0.15,y*CELL+CELL*0.85); ctx.closePath(); ctx.fill(); }
+    }
+  }
+  // goal square
+  ctx.fillStyle='#2b6bf7'; ctx.fillRect(Game.goal.x*CELL+2, Game.goal.y*CELL+2, CELL-4, CELL-4);
+  // player circle
+  ctx.beginPath(); ctx.fillStyle= Game.player.alive ? '#00b050' : '#666';
+  ctx.arc(Game.player.x*CELL + CELL/2, Game.player.y*CELL + CELL/2, CELL*0.38, 0, Math.PI*2); ctx.fill();
+
+  // HUD
+  document.getElementById('stats').innerText = `Turn: ${Game.turn} | Player: (${Game.player.x},${Game.player.y}) | Points: ${Game.player.points} | Alive: ${Game.player.alive}`;
+  // matrix preview (a small text representation)
+  const arr = [];
+  for(let y=0;y<H;y++){
+    let row = '';
+    for(let x=0;x<W;x++){
+      if(Game.player.x===x && Game.player.y===y) row += 'P';
+      else if(Game.goal.x===x && Game.goal.y===y) row += 'G';
+      else {
+        const v = Game.grid[idx(x,y)];
+        row += (v===EMPTY?'.':(v===TRAP_PREVIEW?'X':'^'));
+      }
+    }
+    arr.push(row);
+  }
+  document.getElementById('matrixOut').textContent = arr.join('\n');
+  listeners.forEach(cb=>{ try{ cb(GameAPI.getState()) }catch(e){} })
+}
+
+// wire buttons
+document.getElementById('stepBtn').addEventListener('click', ()=>{ GameAPI.tick(); render(); });
+document.getElementById('skipBtn').addEventListener('click', ()=>{ GameAPI.skip(); render(); });
+document.getElementById('resetBtn').addEventListener('click', ()=>{ GameAPI.reset(); render(); });
+
+// moves
+document.getElementById('moveUp').addEventListener('click', ()=>{ GameAPI.move(0,-1); render(); });
+document.getElementById('moveDown').addEventListener('click', ()=>{ GameAPI.move(0,1); render(); });
+document.getElementById('moveLeft').addEventListener('click', ()=>{ GameAPI.move(-1,0); render(); });
+document.getElementById('moveRight').addEventListener('click', ()=>{ GameAPI.move(1,0); render(); });
+
+// spawn prob control
+const spawnProbEl = document.getElementById('spawnProb'); spawnProbEl.addEventListener('input', e=>{ GameAPI.setSpawnProb(e.target.value); });
+
+// export
+document.getElementById('exportState').addEventListener('click', ()=>{
+  const s = JSON.stringify(GameAPI.getState());
+  const blob = new Blob([s],{type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'game_state.json'; a.click();
+});
+
+// move goal randomly
+document.getElementById('randomizeGoal').addEventListener('click', ()=>{
+  Game.goal.x = rnd(W); Game.goal.y = rnd(H); render();
+});
+
+// Allow clicking on the board to move (or spawn trap with alt-click)
+canvas.addEventListener('click', (ev)=>{
+  const r = canvas.getBoundingClientRect();
+  const x = Math.floor((ev.clientX - r.left)/CELL);
+  const y = Math.floor((ev.clientY - r.top)/CELL);
+  if(ev.altKey){ GameAPI.spawnTrapAt(x,y); }
+  else { GameAPI.moveTo(x,y); }
+  render();
+});
+
+// arrow keys
+window.addEventListener('keydown', (e)=>{
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)){
+    e.preventDefault();
+    const map = {ArrowUp:[0,-1],ArrowDown:[0,1],ArrowLeft:[-1,0],ArrowRight:[1,0]};
+    const [dx,dy] = map[e.key]; GameAPI.move(dx,dy); render();
+  }
+});
+
+// initialize a few traps for demo
+for(let i=0;i<12;i++) GameAPI.spawnTrapAt(rnd(W), rnd(H));
+render();
+
+// --- Optional: Example Node/Express "backend" implementation (paste into server.js if you want a real HTTP API) ---
+/*
+// server.js (Node.js + express) — optional
+const express = require('express');
+const app = express();
+app.use(express.json());
+
+// In a real deployment you'd import/require the same game logic as above and expose endpoints:
+let backendState = null; // keep in memory
+
+app.get('/state', (req,res)=>{
+  res.json(backendState);
+});
+
+app.post('/action', (req,res)=>{
+  const {action, payload} = req.body;
+  // action can be 'move','skip','spawn','reset','tick','moveTo'
+  // apply to backendState accordingly and return new state
+  res.json({ok:true});
+});
+
+app.listen(3000, ()=>console.log('Server listening on :3000'));
+*/
+
+</script>
+</body>
+</html>
