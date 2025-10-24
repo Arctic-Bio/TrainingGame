@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>32x32 Grid — Rule-Deducing Agent (Pure Trial & Error)</title>
+<style>
+  body{font-family:sans-serif;margin:10px;}
+  canvas{border:1px solid #333; background:#f7f7fb;}
+  .controls{margin-top:10px;}
+  .controls button{margin-right:5px;}
+  .controls label{display:inline-block; margin-right:15px; white-space:nowrap;}
+  #info{margin-top:10px;}
+</style>
+</head>
+<body>
+<h2>32x32 Grid — Agent Learns Rules from Scratch (Trial & Error to Math Optimization)</h2>
+<canvas id="board" width="576" height="576"></canvas>
+<div class="controls">
+  <button id="stepBtn">Step Agent</button>
+  <button id="autoBtn">Run Auto Generations</button>
+  <button id="resetBtn">Reset Game</button>
+  <button id="resetQBtn">Reset Learning (Q, Model, Obs, TypeV)</button>
+  <label>Trap Probability: <input type="range" id="spawnProb" min="0" max="1" step="0.001" value="0.06" style="width:200px;"/> <span id="probValue">0.060</span></label>
+  <label>Generations: <input type="number" id="gens" value="10" min="1"/></label>
+  <label>Epsilon: <input type="range" id="epsilon" min="0" max="1" step="0.01" value="0.5" style="width:150px;"/> <span id="epsValue">0.50</span></label>
+</div>
+<pre id="info"></pre>
+
+<script>
+// --- Constants ---
+// Grid dimensions and cell size for rendering
+const W = 32;  // Width in cells
+const H = 32;  // Height in cells
+const CELL = 18;  // Pixel size per cell
+
+// Cell state types: 0=empty (safe), 1=TRAP_X (impending danger, visible marker), 2=TRAP_SPIKE (instant death)
+const EMPTY = 0;
+const TRAP_X = 1;
+const TRAP_SPIKE = 2;
+
+// --- Game State Variables ---
+// Grid: 1D array representing cell states (flattened 2D)
+let grid = new Uint8Array(W * H);
+
+// Player: Position and alive status
+let player = {x: 1, y: 1, alive: true};
+
+// Goal: Fixed position (bottom-right-ish, avoiding edges)
+let goal = {x: W - 2, y: H - 2};
+
+// Turn counter for game progression
+let turn = 0;
+
+// Trap spawn probability per empty cell (user-adjustable)
+let spawnProb = 0.06;
+
+// Previous grid snapshot for transition observation (global experience)
+let prevGrid = null;
+
+// Experience buffer for agent's direct landings (local trial & error)
+let localExperiences = [];  // {type: landedType, r: reward}
+
+// --- Learning System ---
+// Positional Q-table: Q[stateIdx][actionIdx] — starts at 0, pure learning
+let Q = new Array(W * H).fill(null).map(() => new Array(4).fill(0));  // 4 actions: 0=down, 1=right, 2=up, 3=left
+
+// Type values: typeV[type] — learned value of landing on that type (from direct experience)
+let typeV = [0, 0, 0];  // Starts neutral: learns if good/bad via rewards
+
+// Transition counts for rule deduction: transCount[fromType][toType] — global observations
+let transCount = Array.from({length: 3}, () => Array(3).fill(0));
+
+// Learned model: probs[fromType][toType] — updated from counts
+let modelProbs = Array.from({length: 3}, () => Array(3).fill(0));
+
+// Rules learned flag: true when confident in core dynamics (X->S, S->S, low E->S)
+let learnedRules = false;
+
+// Danger thresholds: Based on learned probs (e.g., if P(to S) > thresh, avoid)
+const DANGER_THRESH = 0.8;  // Avoid type if high prob to deadly next turn
+
+// Learning hyperparameters
+let alpha = 0.1;  // Q-learning rate
+let typeAlpha = 0.2;  // Faster for typeV (quickly learn dangers)
+let gamma = 0.9;  // Discount factor
+let epsilon = 0.5;  // High initial exploration for trial & error (decays slowly)
+
+// Minimum global observations for confidence
+const MIN_OBS = 50;  // More obs for reliability
+const CONF_THRESHOLD = 0.95;  // High confidence for X->S, S->S
+
+// --- Utility Functions ---
+// Convert (x,y) to 1D array index
+const idx = (x, y) => y * W + x;
+
+// Random integer from 0 to n-1
+const rnd = (n) => Math.floor(Math.random() * n);
+
+// Check if position is within grid bounds
+const inBounds = (x, y) => x >= 0 && x < W && y >= 0 && y < H;
+
+// Euclidean distance between two points (for goal proximity)
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+// Update model probs from counts
+function updateModel() {
+  for (let f = 0; f < 3; f++) {
+    let sum = 0;
+    for (let t = 0; t < 3; t++) sum += transCount[f][t];
+    if (sum > 0) {
+      for (let t = 0; t < 3; t++) {
+        modelProbs[f][t] = transCount[f][t] / sum;
+      }
+    }
+  }
+}
+
+// Check if core rules deduced: X almost always -> S, S stays S, E rarely -> S
+function isRulesLearned() {
+  let totalObs = 0;
+  for (let row of transCount) {
+    for (let c of row) totalObs += c;
+  }
+  if (totalObs < MIN_OBS) return false;
+
+  updateModel();  // Ensure fresh
+  // Key rules: P(X->S) high, P(S->S) high, P(E->S) low
+  if (modelProbs[TRAP_X][TRAP_SPIKE] < CONF_THRESHOLD) return false;
+  if (modelProbs[TRAP_SPIKE][TRAP_SPIKE] < CONF_THRESHOLD) return false;
+  if (modelProbs[EMPTY][TRAP_SPIKE] > 0.05) return false;  // Tolerate tiny spawn-to-S error
+  return true;
+}
+
+// Predict danger of a cell type: Prob to S in 1 step
+function getDanger(type) {
+  return modelProbs[type][TRAP_SPIKE];
+}
+
+// Get next action via BFS (model-based: avoid high-danger predicted cells)
+function getNextAction(sx, sy) {
+  if (sx === goal.x && sy === goal.y) return -1; // At goal
+
+  const dirs = [[1, 0], [0, 1], [-1, 0], [0, -1]]; // down=0, right=1, up=2, left=3
+
+  let queue = [];
+  let startIdx = idx(sx, sy);
+  queue.push({idx: startIdx, steps: 0});
+  let visited = new Set([startIdx]);
+  let parent = new Map();  // {child: {prev, action}}
+  parent.set(startIdx, {prev: -1, action: -1});
+
+  let goalIdx = idx(goal.x, goal.y);
+  let found = false;
+
+  while (queue.length > 0 && !found) {
+    let {idx: currIdx, steps} = queue.shift();
+    let cx = currIdx % W;
+    let cy = Math.floor(currIdx / W);
+
+    if (currIdx === goalIdx) {
+      found = true;
+      break;
+    }
+
+    // Limit search depth to prevent long computation (practical)
+    if (steps > 100) continue;
+
+    for (let a = 0; a < 4; a++) {
+      let [dy, dx] = dirs[a];
+      let nx = cx + dx;
+      let ny = cy + dy;
+      if (!inBounds(nx, ny)) continue;
+      let ni = idx(nx, ny);
+      if (visited.has(ni)) continue;
+
+      let ntype = grid[ni];
+      let danger = getDanger(ntype);
+      if (danger > DANGER_THRESH) continue;  // Avoid predicted deadly
+
+      visited.add(ni);
+      queue.push({idx: ni, steps: steps + 1});
+      parent.set(ni, {prev: currIdx, action: a});
+    }
+  }
+
+  if (!found || !parent.has(goalIdx)) return null; // No safe path
+
+  // Backtrack for first action
+  let c = goalIdx;
+  while (parent.get(c).prev !== startIdx) {
+    c = parent.get(c).prev;
+  }
+  return parent.get(c).action;
+}
+
+// --- Q-Table Initialization: Pure Zero — No Priors ---
+function initQ() {
+  // All Q=0: Agent starts blind, learns purely from rewards
+  // No distance heuristic: True trial & error
+}
+
+// --- Game Reset (New Episode) ---
+function reset() {
+  grid.fill(EMPTY);
+  player = {x: 1, y: 1, alive: true};
+  goal = {x: W - 2, y: H - 2};
+  turn = 0;
+  prevGrid = null;
+  localExperiences = [];
+  spawnRandomTraps();
+  render();
+}
+
+// --- Trap Spawning and Advancement ---
+function spawnRandomTraps() {
+  const startIdx = idx(1, 1);
+  const goalIdx = idx(goal.x, goal.y);
+  for (let i = 0; i < W * H; i++) {
+    if (grid[i] === EMPTY && i !== startIdx && i !== goalIdx && Math.random() < spawnProb) {
+      grid[i] = TRAP_X;
+    }
+  }
+}
+
+function advanceTraps() {
+  for (let i = 0; i < W * H; i++) {
+    if (grid[i] === TRAP_X) {
+      grid[i] = TRAP_SPIKE;
+    }
+  }
+}
+
+// --- Agent Movement (Trial & Error Exploration -> Model-Based Optimization) ---
+function moveAgent() {
+  if (!player.alive) return;
+
+  const s = idx(player.x, player.y);
+  const dirs = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+
+  const possibleAs = [];
+  for (let a = 0; a < 4; a++) {
+    const [dy, dx] = dirs[a];
+    if (inBounds(player.x + dx, player.y + dy)) {
+      possibleAs.push(a);
+    }
+  }
+  if (possibleAs.length === 0) return;
+
+  let a;
+  if (learnedRules) {
+    // Optimization phase: Model-based planning (mathematical shortest path avoiding dangers)
+    a = getNextAction(player.x, player.y);
+    if (a === null || a === -1) {
+      // No path or at goal: Random (fallback for blocked mazes)
+      a = possibleAs[rnd(possibleAs.length)];
+    }
+  } else {
+    // Exploration phase: Epsilon-greedy with Q + typeV (learns to avoid bad types via direct experience)
+    if (Math.random() < epsilon) {
+      a = possibleAs[rnd(possibleAs.length)];  // Trial: Random actions
+    } else {
+      // Error correction: Best estimated future value
+      let bestScore = -Infinity;
+      a = possibleAs[0];
+      const oldDist = dist(player, goal);
+      for (let ai of possibleAs) {
+        const [dy, dx] = dirs[ai];
+        const nx = player.x + dx;
+        const ny = player.y + dy;
+        const targetType = grid[idx(nx, ny)];
+        const newDist = dist({x: nx, y: ny}, goal);
+
+        // Score: Positional Q (path memory) + Type value (rule learning) + Mild distance progress (anti-stuck)
+        let score = 0.4 * Q[s][ai] + 0.5 * typeV[targetType] + 0.1 * (oldDist - newDist) * 5;
+
+        // Cap to prevent extremes
+        score = Math.max(score, -200);
+
+        if (score > bestScore) {
+          bestScore = score;
+          a = ai;
+        }
+      }
+    }
+  }
+
+  // Execute: Move
+  const [dy, dx] = dirs[a];
+  const nx = player.x + dx;
+  const ny = player.y + dy;
+  const oldDist = dist(player, goal);
+
+  player.x = nx;
+  player.y = ny;
+
+  // Immediate reward: Step cost + distance progress
+  let r = -0.01 + (oldDist - dist(player, goal)) * 5;
+  // Boost near goal
+  if (dist(player, goal) < 5) r += (oldDist - dist(player, goal)) * 10;
+
+  const s_prime = idx(nx, ny);
+  let terminal = false;
+
+  const landedType = grid[s_prime];
+
+  // Record local experience (direct trial on landed cell)
+  localExperiences.push({type: landedType, r: 0});  // r updated later
+
+  // Death on landing (if S)
+  if (landedType === TRAP_SPIKE) {
+    r -= 100;  // Harsh penalty for spikes
+    localExperiences[localExperiences.length - 1].r = r;
+    player.alive = false;
+    terminal = true;
+  }
+
+  // Goal check
+  if (player.x === goal.x && player.y === goal.y) {
+    r += 100;  // Success!
+    localExperiences[localExperiences.length - 1].r = r;
+    player.alive = false;
+    terminal = true;
+  }
+
+  // Snapshot for global transition obs (experience of environment changes)
+  prevGrid = new Uint8Array(grid);
+
+  // Advance environment (rules apply here: X -> S)
+  stepTurn();
+
+  // Post-advance: Death if now on S (e.g., landed on X, it became S)
+  if (grid[s_prime] === TRAP_SPIKE) {
+    r -= 100;
+    localExperiences[localExperiences.length - 1].r = r;
+    player.alive = false;
+    terminal = true;
+  }
+
+  // Update local exp reward if not set
+  if (localExperiences[localExperiences.length - 1].r === 0) {
+    localExperiences[localExperiences.length - 1].r = r;
+  }
+
+  // Limit local buffer (recent trials)
+  if (localExperiences.length > 50) localExperiences.shift();
+
+  // Global transition observations: Deduce rules from env changes (passive experience)
+  if (prevGrid) {
+    for (let i = 0; i < W * H; i++) {
+      let from = prevGrid[i];
+      let to = grid[i];
+      transCount[from][to]++;
+    }
+    prevGrid = null;
+  }
+
+  // Learn type value: Update based on outcome of landing on landedType (learns X bad because often -> death)
+  typeV[landedType] += typeAlpha * (r - typeV[landedType]);
+
+  // Check rule deduction
+  if (!learnedRules && isRulesLearned()) {
+    learnedRules = true;
+    console.log('Rules deduced! Switching to model-based planning.');
+  }
+
+  // Q-Update: Only during exploration (pure trial & error learning)
+  if (!learnedRules) {
+    let maxQ_next = terminal ? 0 : Math.max(...Q[s_prime]);
+    const td_target = r + gamma * maxQ_next;
+    Q[s][a] += alpha * (td_target - Q[s][a]);
+
+    // Epsilon decay: Slowly, to allow more trials
+    if (terminal && !player.alive) {
+      epsilon = Math.max(0.05, epsilon * 0.95);  // Gradual
+    }
+  }
+
+  // Render
+  render();
+}
+
+// --- Environment Step ---
+function stepTurn() {
+  turn++;
+  advanceTraps();
+  spawnRandomTraps();
+}
+
+// --- Rendering ---
+const canvas = document.getElementById('board');
+const ctx = canvas.getContext('2d');
+
+function render() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, y);
+      const v = grid[i];
+
+      // Cell colors (neutral, no bias)
+      ctx.fillStyle = (v === EMPTY ? '#f7f7fb' : (v === TRAP_X ? '#fff3cc' : '#ffe6e6'));
+      ctx.fillRect(x * CELL, y * CELL, CELL, CELL);
+
+      ctx.strokeStyle = '#ccc';
+      ctx.strokeRect(x * CELL, y * CELL, CELL, CELL);
+
+      // Overlay: Q during exploration (fade as learned)
+      if (!learnedRules && Q[i]) {
+        let h = Math.max(...Q[i]);
+        if (h !== 0) {
+          const alphaOverlay = Math.min(0.5, Math.abs(h) * 0.005);  // Subtle
+          ctx.fillStyle = (h > 0 ? `rgba(0,255,0,${alphaOverlay})` : `rgba(255,0,0,${alphaOverlay})`);
+          ctx.fillRect(x * CELL, y * CELL, CELL, CELL);
+        }
+      }
+
+      // Predicted danger overlay (once learned: red tint for high danger)
+      if (learnedRules) {
+        let danger = getDanger(v);
+        if (danger > DANGER_THRESH) {
+          ctx.fillStyle = `rgba(255,0,0,${Math.min(0.3, danger * 0.5)})`;
+          ctx.fillRect(x * CELL, y * CELL, CELL, CELL);
+        }
+      }
+
+      // TypeV overlay during exploration: Color tint based on learned value (red=bad, green=good)
+      if (!learnedRules && typeV[v] !== 0) {
+        const alphaOverlay = Math.min(0.4, Math.abs(typeV[v]) * 0.02);
+        ctx.fillStyle = (typeV[v] > 0 ? `rgba(0,255,0,${alphaOverlay})` : `rgba(255,0,0,${alphaOverlay})`);
+        ctx.fillRect(x * CELL, y * CELL, CELL, CELL);
+      }
+
+      // Markers
+      if (v === TRAP_X) {
+        ctx.fillStyle = '#b45f06';
+        ctx.font = '12px monospace';
+        ctx.fillText('X', x * CELL + CELL / 3, y * CELL + CELL * 0.65);
+      }
+      if (v === TRAP_SPIKE) {
+        ctx.fillStyle = '#990000';
+        ctx.beginPath();
+        ctx.moveTo(x * CELL + CELL * 0.5, y * CELL + CELL * 0.15);
+        ctx.lineTo(x * CELL + CELL * 0.85, y * CELL + CELL * 0.85);
+        ctx.lineTo(x * CELL + CELL * 0.15, y * CELL + CELL * 0.85);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+  }
+
+  // Goal
+  ctx.fillStyle = '#2b6bf7';
+  ctx.fillRect(goal.x * CELL + 2, goal.y * CELL + 2, CELL - 4, CELL - 4);
+
+  // Player
+  ctx.beginPath();
+  ctx.fillStyle = (player.alive ? '#00b050' : '#666');
+  ctx.arc(player.x * CELL + CELL / 2, player.y * CELL + CELL / 2, CELL * 0.38, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Info: Show learning progress
+  let status = player.alive ? 'Alive' : (dist(player, goal) < 0.5 ? 'Won!' : 'Dead');
+  const d = dist(player, goal).toFixed(2);
+  let totalObs = 0;
+  for (let row of transCount) for (let c of row) totalObs += c;
+  updateModel();
+  let pXS = modelProbs[TRAP_X][TRAP_SPIKE].toFixed(3);
+  let pSS = modelProbs[TRAP_SPIKE][TRAP_SPIKE].toFixed(3);
+  let pES = modelProbs[EMPTY][TRAP_SPIKE].toFixed(3);
+  let localDeaths = localExperiences.filter(exp => exp.r < -50).length;
+  let mode = learnedRules ? 'Optimizing (Model BFS)' : 'Trial & Error (Q + TypeV)';
+  let typeVStr = `TypeV: E=${typeV[0].toFixed(1)} X=${typeV[1].toFixed(1)} S=${typeV[2].toFixed(1)}`;
+  document.getElementById('info').textContent = 
+    `Turn: ${turn} | Pos: (${player.x},${player.y}) | Status: ${status} | Dist: ${d} | Eps: ${epsilon.toFixed(2)} | Obs: ${totalObs} | P(X->S):${pXS} P(S->S):${pSS} P(E->S):${pES} | Local Deaths: ${localDeaths} | ${typeVStr} | Mode: ${mode}`;
+}
+
+// --- Controls ---
+document.getElementById('stepBtn').addEventListener('click', () => moveAgent());
+
+document.getElementById('resetBtn').addEventListener('click', () => reset());
+
+document.getElementById('resetQBtn').addEventListener('click', () => {
+  Q = new Array(W * H).fill(null).map(() => new Array(4).fill(0));
+  typeV = [0, 0, 0];
+  transCount = Array.from({length: 3}, () => Array(3).fill(0));
+  modelProbs = Array.from({length: 3}, () => Array(3).fill(0));
+  learnedRules = false;
+  localExperiences = [];
+  epsilon = 0.5;  // High for fresh trials
+  initQ();  // Zeros
+  render();
+});
+
+document.getElementById('spawnProb').addEventListener('input', (e) => {
+  spawnProb = parseFloat(e.target.value);
+  document.getElementById('probValue').textContent = spawnProb.toFixed(3);
+});
+
+document.getElementById('epsilon').addEventListener('input', (e) => {
+  epsilon = parseFloat(e.target.value);
+  document.getElementById('epsValue').textContent = epsilon.toFixed(2);
+});
+
+let autoRunning = false;
+document.getElementById('autoBtn').addEventListener('click', () => {
+  if (autoRunning) return;
+  autoRunning = true;
+  const gens = parseInt(document.getElementById('gens').value) || 10;
+  let currentGen = 0;
+  const initialEpsilon = epsilon;
+
+  function runGen() {
+    reset();
+
+    function stepInterval() {
+      if (player.alive) {
+        moveAgent();
+        setTimeout(stepInterval, 50);  // Slower for observation
+      } else {
+        currentGen++;
+        if (!learnedRules) {
+          // Per-gen epsilon decay for progression
+          epsilon = Math.max(0.05, epsilon * 0.98);
+          document.getElementById('epsilon').value = epsilon;
+          document.getElementById('epsValue').textContent = epsilon.toFixed(2);
+        }
+        if (currentGen < gens) {
+          setTimeout(runGen, 200);  // Pause to see results
+        } else {
+          autoRunning = false;
+          epsilon = initialEpsilon;
+          document.getElementById('epsilon').value = epsilon;
+          document.getElementById('epsValue').textContent = epsilon.toFixed(2);
+        }
+      }
+    }
+    stepInterval();
+  }
+  runGen();
+});
+
+// --- Initialization ---
+initQ();  // Zeros only
+reset();  // Start blind
+</script>
+</body>
+</html>
