@@ -7,3 +7,5 @@ I need a novel architecture for an AI algorithm that does not simply aim for sys
 Imagine an AI navigating an adaptive video game that changes with each iteration. It cannot be trained to follow a single optimal path. Instead, it learns the function of each element so that it can make informed decisions, avoid traps, and adapt to new challenges. The focus is on training intelligence rather than memorizing a route.
 
 The process can be summarized as: Concept, Simplify, Abstract, Compare and Contrast, Deduce, Extend, Rebuild, Organize, Review.
+
+We cannot teach a level of a game, we have to train it to learn teh rules. Learn how too learn. AGI vs Ai is teh difference from knowing what eevry combination of numbers 1-10 equals, and being able to extend that concept into arithmatic in a generalized form. Facts to concepts to extensions, to utilization.
