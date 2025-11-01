@@ -8,4 +8,4 @@ Imagine an AI navigating an adaptive video game that changes with each iteration
 
 The process can be summarized as: Concept, Simplify, Abstract, Compare and Contrast, Deduce, Extend, Rebuild, Organize, Review.
 
-We cannot teach a level of a game, we have to train it to learn teh rules. Learn how too learn. AGI vs Ai is teh difference from knowing what eevry combination of numbers 1-10 equals, and being able to extend that concept into arithmatic in a generalized form. Facts to concepts to extensions, to utilization.
+We cannot teach a level of a game, we have to train it to learn teh rules. Learn how too learn. AGI vs Ai is the difference from knowing what every combination of numbers 1-10 equals, and being able to extend that concept into arithmatic in a generalized form. Facts to concepts to extensions, to utilization.
